@@ -1,0 +1,9 @@
+[package]
+name = "pokedit"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.83"
+simple_logger = "5.0.0"
+pokedit-lib = { path = "../pokedit-lib" }

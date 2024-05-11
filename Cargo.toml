@@ -1,0 +1,3 @@
+[workspace]
+members = ["pokedit", "pokedit-lib"]
+resolver = "2"
