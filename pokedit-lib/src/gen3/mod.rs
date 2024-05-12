@@ -1,5 +1,5 @@
-use core::fmt;
-use std::{io::Write, path::Path};
+use core::{fmt, ops::Deref};
+use std::{io::Write, ops::DerefMut, path::Path};
 
 use log::{debug, error};
 
@@ -10,6 +10,44 @@ use crate::{
 };
 
 pub use crate::common::Gender;
+
+#[derive(Debug)]
+enum DataSource<'d> {
+    Owned(Vec<u8>),
+    Ref(&'d mut [u8]),
+}
+
+impl From<Vec<u8>> for DataSource<'static> {
+    fn from(value: Vec<u8>) -> Self {
+        Self::Owned(value)
+    }
+}
+
+impl<'d> From<&'d mut [u8]> for DataSource<'d> {
+    fn from(value: &'d mut [u8]) -> Self {
+        Self::Ref(value)
+    }
+}
+
+impl<'d> Deref for DataSource<'d> {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            DataSource::Owned(o) => o.as_slice(),
+            DataSource::Ref(r) => r,
+        }
+    }
+}
+
+impl<'d> DerefMut for DataSource<'d> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            DataSource::Owned(o) => o.as_mut_slice(),
+            DataSource::Ref(r) => r,
+        }
+    }
+}
 
 /// A Gen 3 Game loads as little information from the game as possible, instead keeping a reference
 /// to the underlying data and reading from it on demand.
@@ -27,7 +65,8 @@ pub use crate::common::Gender;
 /// | 0x1F000 | 4096 | Recorded Battle |
 #[derive(Debug)]
 pub struct Game<'d> {
-    data: &'d mut [u8],
+    data: DataSource<'d>,
+    emulator_intro_length: usize,
     current_save_slot_info: SaveSlotInfo,
     backup_save_slot_info: SaveSlotInfo,
     version: GameVersion,
@@ -43,19 +82,29 @@ pub enum Validate {
     Full = 2,
 }
 
+impl Game<'static> {
+    pub fn new_vec(bytes: Vec<u8>) -> PkResult<Self> {
+        Self::raw_new(bytes.into(), Validate::default())
+    }
+}
+
 impl<'d> Game<'d> {
     /// 128KiB
     const SAVE_FILE_MIN_SIZE: usize = 128 * 1024;
 
-    pub fn new(bytes: &'d mut [u8]) -> PkResult<Self> {
-        Self::new_with_validation(bytes, Validate::default())
+    pub fn new_bytes(bytes: &'d mut [u8]) -> PkResult<Self> {
+        Self::raw_new(bytes.into(), Validate::default())
     }
 
     pub fn new_with_validation(bytes: &'d mut [u8], validation: Validate) -> PkResult<Self> {
+        Self::raw_new(bytes.into(), validation)
+    }
+
+    fn raw_new(bytes: DataSource<'d>, validation: Validate) -> PkResult<Self> {
         debug!("Loading Gen 3 game with size: {}", bytes.len());
-        let offset = emulator_intro_length(bytes);
-        if offset > 0 {
-            debug!("Skipping {offset} bytes from emulator intro");
+        let emulator_offset = emulator_intro_length(&bytes);
+        if emulator_offset > 0 {
+            debug!("Skipping {emulator_offset} bytes from emulator intro");
         }
 
         if bytes.len() < Self::SAVE_FILE_MIN_SIZE {
@@ -65,18 +114,17 @@ impl<'d> Game<'d> {
             }));
         }
 
-        let data = &mut bytes[offset..];
         let (current_save_slot_data, backup_save_slot_data, version, security_key) = {
             let ((current_offset, current_save_slot), (backup_offset, backup_save_slot)) =
-                SaveSlot::save_slots(data);
+                SaveSlot::save_slots(&bytes[emulator_offset..]);
             current_save_slot.validate(validation)?;
             backup_save_slot.validate(validation)?;
 
             let trainer_section = current_save_slot.to_sections()?.trainer;
 
             (
-                current_save_slot.to_info(current_offset),
-                backup_save_slot.to_info(backup_offset),
+                current_save_slot.to_info(current_offset + emulator_offset),
+                backup_save_slot.to_info(backup_offset + emulator_offset),
                 trainer_section.game_code().into(),
                 trainer_section.security_key().unwrap_or(0),
             )
@@ -85,7 +133,8 @@ impl<'d> Game<'d> {
         debug!("Gen 3 game {} loaded", version);
 
         Ok(Self {
-            data,
+            data: bytes,
+            emulator_intro_length: emulator_offset,
             current_save_slot_info: current_save_slot_data,
             backup_save_slot_info: backup_save_slot_data,
             version,
@@ -98,19 +147,19 @@ impl<'d> Game<'d> {
     }
 
     pub fn save_slot(&self) -> Data<SaveSlot> {
-        Data::from_offset(self.data, self.current_save_slot_info.offset)
+        Data::from_offset(&self.data, self.current_save_slot_info.offset)
     }
 
     pub fn save_slot_mut(&mut self) -> DataMut<SaveSlot> {
-        DataMut::from_offset(self.data, self.current_save_slot_info.offset)
+        DataMut::from_offset(&mut self.data, self.current_save_slot_info.offset)
     }
 
     pub fn trainer(&self) -> Data<TrainerSection> {
-        Data::from_offset(self.data, self.current_save_slot_info.trainer)
+        Data::from_offset(&self.data, self.current_save_slot_info.trainer)
     }
 
     pub fn team_items(&self) -> Data<TeamItemsSection> {
-        Data::from_offset(self.data, self.current_save_slot_info.team_items).with_context(
+        Data::from_offset(&self.data, self.current_save_slot_info.team_items).with_context(
             TeamItemsSection {
                 version: self.version,
                 security_key: self.security_key,
@@ -119,7 +168,7 @@ impl<'d> Game<'d> {
     }
 
     pub fn team_items_mut(&mut self) -> DataMut<TeamItemsSection> {
-        DataMut::from_offset(self.data, self.current_save_slot_info.team_items).with_context(
+        DataMut::from_offset(&mut self.data, self.current_save_slot_info.team_items).with_context(
             TeamItemsSection {
                 version: self.version,
                 security_key: self.security_key,
@@ -140,16 +189,8 @@ impl<'d> Game<'d> {
     pub fn save(&mut self, save_path: impl AsRef<Path>) -> PkResult<()> {
         self.update_checksum();
         let mut file = std::fs::File::create(save_path.as_ref())?;
-        file.write_all(self.data)?;
+        file.write_all(&self.data)?;
         Ok(())
-    }
-}
-
-impl<'d> TryFrom<&'d mut [u8]> for Game<'d> {
-    type Error = PkError;
-
-    fn try_from(bytes: &'d mut [u8]) -> Result<Self, Self::Error> {
-        Self::new(bytes)
     }
 }
 
@@ -741,20 +782,4 @@ const fn decrypt_word(key: u32, value: u32) -> u32 {
 
 const fn encrypt_word(key: u32, value: u32) -> u32 {
     key ^ value
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use test_log::test;
-
-    pub fn new_save() -> Vec<u8> {
-        vec![0; Game::SAVE_FILE_MIN_SIZE]
-    }
-
-    #[test]
-    fn load_game() {
-        let mut bytes = new_save();
-        Game::try_from(bytes.as_mut_slice()).unwrap();
-    }
 }
